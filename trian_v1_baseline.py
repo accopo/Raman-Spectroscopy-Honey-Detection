@@ -432,3 +432,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+#sbatch run_main_v1.sh
