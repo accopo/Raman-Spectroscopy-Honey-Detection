@@ -10,4 +10,4 @@ source ~/.bashrc
 conda activate raman_env
 
 # 2. 运行
-python -u train_v2_tuning.py
+python -u train_test.py
