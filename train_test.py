@@ -85,7 +85,7 @@ def main():
     print(f"🚀 当前使用的设备: {device}")
 
     # 1. 准备数据
-    csv_file_path = '/public/home/liuzhenfang/datasets/honey_spectral_processed_all.csv'
+    csv_file_path = 'honey_spectral_processed_all.csv'
     
     train_dataset = RamanDataset(csv_path=csv_file_path, is_train=True)
     val_dataset = RamanDataset(csv_path=csv_file_path, is_train=False) 

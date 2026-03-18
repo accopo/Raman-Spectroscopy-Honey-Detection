@@ -165,7 +165,7 @@ def plot_attention_map(model, X_tensor, features_raw, wavenumbers, labels_bin, d
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    csv_path = '/public/home/liuzhenfang/datasets/honey_spectral_processed_all.csv'
+    csv_path = 'honey_spectral_processed_all.csv'
     weight_path = 'best_raman_v3.pth'
     
     # 1. 加载所有数据和训练好的模型
@@ -189,3 +189,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+#sbatch run_test.sh
