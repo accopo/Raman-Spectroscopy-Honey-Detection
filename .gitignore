@@ -22,6 +22,7 @@ datasets/
 *.ckpt
 # 过滤掉我们脚本自动生成的图表和结果文件夹
 ml_results/
+covid_model_results/
 # 过滤掉 Slurm 和终端输出的测试日志
 train_log.txt
 gpu_test_result.txt
