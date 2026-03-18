@@ -108,7 +108,7 @@ class OptimizedCNN_Wrapper:
     """
     无损微调特化版 Wrapper
     """
-    def __init__(self, epochs=65, batch_size=16, lr=0.001, pure_threshold=0.40):  
+    def __init__(self, epochs=65, batch_size=16, lr=0.001, pure_threshold=0.35):  
         self.epochs = epochs
         self.batch_size = batch_size
         self.lr = lr
