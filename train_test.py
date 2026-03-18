@@ -113,7 +113,7 @@ def main():
     save_path = 'best_raman_v3.pth'
 
     # 4. 开始训练循环
-    num_epochs = 50
+    num_epochs = 70
     for epoch in range(num_epochs):
         model.train()
         total_train_loss = 0.0

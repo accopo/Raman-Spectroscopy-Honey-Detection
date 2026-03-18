@@ -4,9 +4,9 @@ from sklearn.metrics import accuracy_score, confusion_matrix
 import os
 import warnings
 import matplotlib.pyplot as plt
-import seaborn as sns  # 新增：用于绘制极其精美的热力图和混淆矩阵
+import seaborn as sns
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.manifold import TSNE  # 新增：用于高维光谱的 t-SNE 降维流线图
+from sklearn.manifold import TSNE
 from itertools import combinations
 import re
 import torch
@@ -24,24 +24,53 @@ plt.rcParams['axes.unicode_minus'] = False
 
 
 # ==========================================
-# 【论文创新 1】: 1D 通道注意力机制模块
+# 【V3 核心创新 1】: 1D CBAM 双域注意力机制
+# (同时包含 Channel Attention 与 Spatial Attention)
 # ==========================================
-class SEBlock1D(nn.Module):
-    def __init__(self, channel, reduction=4):
-        super(SEBlock1D, self).__init__()
+class ChannelAttention1D(nn.Module):
+    def __init__(self, in_planes, ratio=8):
+        super(ChannelAttention1D, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
         self.fc = nn.Sequential(
-            nn.Linear(channel, channel // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channel // reduction, channel, bias=False),
-            nn.Sigmoid()
+            nn.Conv1d(in_planes, in_planes // ratio, 1, bias=False),
+            nn.ReLU(),
+            nn.Conv1d(in_planes // ratio, in_planes, 1, bias=False)
         )
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        b, c, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1)
-        return x * y.expand_as(x)
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+class SpatialAttention1D(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention1D, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        self.conv1 = nn.Conv1d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x_cat = torch.cat([avg_out, max_out], dim=1)
+        out = self.conv1(x_cat)
+        return self.sigmoid(out)
+
+class CBAMBlock1D(nn.Module):
+    def __init__(self, channel, ratio=8, kernel_size=7):
+        super(CBAMBlock1D, self).__init__()
+        self.ca = ChannelAttention1D(channel, ratio=ratio)
+        self.sa = SpatialAttention1D(kernel_size=kernel_size)
+
+    def forward(self, x):
+        x = x * self.ca(x)
+        x = x * self.sa(x)
+        return x
+
 
 class FocalLoss(nn.Module):
     def __init__(self, gamma=1.0, reduction='mean'): 
@@ -53,28 +82,27 @@ class FocalLoss(nn.Module):
         ce_loss = F.cross_entropy(inputs, targets, reduction='none')
         pt = torch.exp(-ce_loss)
         focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-        
         if self.reduction == 'mean': return torch.mean(focal_loss)
         elif self.reduction == 'sum': return torch.sum(focal_loss)
         return focal_loss
 
 
 # ==========================================
-# 【论文创新 2】: 双头任务解耦 CNN
+# 【V3 核心创新 2】: RamanDualHeadCNN_V3 (引入特征投影头)
 # ==========================================
-class DualHeadSpectralCNN1D(nn.Module):
+class RamanDualHeadCNN_V3(nn.Module):
     def __init__(self, input_size, num_classes):
-        super(DualHeadSpectralCNN1D, self).__init__()
+        super(RamanDualHeadCNN_V3, self).__init__()
         
         self.features = nn.Sequential(
             nn.Conv1d(1, 16, 5, 1, 2), nn.BatchNorm1d(16), nn.LeakyReLU(0.01),
-            SEBlock1D(16), nn.MaxPool1d(2, 2),
+            CBAMBlock1D(16), nn.MaxPool1d(2, 2),
             
             nn.Conv1d(16, 32, 5, 1, 2), nn.BatchNorm1d(32), nn.LeakyReLU(0.01),
-            SEBlock1D(32), nn.MaxPool1d(2, 2),
+            CBAMBlock1D(32), nn.MaxPool1d(2, 2),
 
             nn.Conv1d(32, 64, 3, 1, 1), nn.BatchNorm1d(64), nn.LeakyReLU(0.01),
-            SEBlock1D(64)
+            CBAMBlock1D(64)
         )
         
         flatten_size = self._get_conv_output((1, input_size))
@@ -88,6 +116,11 @@ class DualHeadSpectralCNN1D(nn.Module):
             nn.Linear(flatten_size, 128), nn.BatchNorm1d(128), nn.LeakyReLU(0.01), nn.Dropout(0.4),
             nn.Linear(128, 2) 
         )
+        
+        # 特征投影头 (Projection Head): 为未来的对比学习做准备
+        self.proj_head = nn.Sequential(
+            nn.Linear(flatten_size, 64), nn.ReLU(), nn.Linear(64, 32)
+        )
 
     def _get_conv_output(self, shape):
         bs = 1
@@ -98,21 +131,23 @@ class DualHeadSpectralCNN1D(nn.Module):
 
     def forward(self, x):
         features = self.features(x)
-        features = features.view(features.size(0), -1) 
+        features_flat = features.view(features.size(0), -1) 
         
-        out_multi = self.head_multi(features)
-        out_bin = self.head_binary(features)
+        out_multi = self.head_multi(features_flat)
+        out_bin = self.head_binary(features_flat)
         
-        return out_multi, out_bin
+        proj_feat = self.proj_head(features_flat)
+        proj_feat = F.normalize(proj_feat, dim=1) # 归一化用于相似度计算
+        
+        return out_multi, out_bin, proj_feat
 
 
-class OptimizedCNN_Wrapper:
+class OptimizedCNN_Wrapper_V3:
     def __init__(self, epochs=65, batch_size=16, lr=0.001, pure_threshold=0.45):  
         self.epochs = epochs
         self.batch_size = batch_size
         self.lr = lr
         self.pure_threshold = pure_threshold 
-        
         self.label_encoder = LabelEncoder()
         self.model = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -121,7 +156,6 @@ class OptimizedCNN_Wrapper:
     def fit(self, X, y):
         y_encoded = self.label_encoder.fit_transform(y)
         num_classes = len(self.label_encoder.classes_)
-        
         self.pure_idx = list(self.label_encoder.classes_).index('Pure')
 
         X_tensor = torch.tensor(X, dtype=torch.float32).unsqueeze(1)
@@ -130,9 +164,10 @@ class OptimizedCNN_Wrapper:
         dataset = TensorDataset(X_tensor, y_tensor)
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
-        self.model = DualHeadSpectralCNN1D(input_size=X.shape[1], num_classes=num_classes).to(self.device)
+        self.model = RamanDualHeadCNN_V3(input_size=X.shape[1], num_classes=num_classes).to(self.device)
         
-        criterion_multi = FocalLoss(gamma=1.0) 
+        # FocalLoss 设为 none，方便后续做动态门控加权
+        criterion_multi = FocalLoss(gamma=1.0, reduction='none') 
         criterion_bin = nn.CrossEntropyLoss(label_smoothing=0.05)  
         
         optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=5e-4)
@@ -149,12 +184,25 @@ class OptimizedCNN_Wrapper:
                 batch_y_bin = (batch_y == self.pure_idx).long()
                 
                 optimizer.zero_grad()
-                out_multi, out_bin = self.model(batch_X_noisy)
                 
-                loss_multi = criterion_multi(out_multi, batch_y)
+                # 接收 V3 架构的三个输出
+                out_multi, out_bin, proj_feat = self.model(batch_X_noisy)
+                
+                # 1. 主头硬分类损失
                 loss_bin = criterion_bin(out_bin, batch_y_bin)
                 
-                loss = 0.75 * loss_bin + 0.25 * loss_multi
+                # 2. 【V3核心创新：Gated Focal Loss】
+                focal_loss_multi_unreduced = criterion_multi(out_multi, batch_y)
+                
+                # 获取二分类主头认为该样本是“掺假(Spiked)”的概率
+                bin_probs = F.softmax(out_bin, dim=1)
+                spiked_prob = bin_probs[:, 0]  # 假设 1 是 Pure，0 是 Spiked
+                
+                # 动态加权：如果判定为纯品(spiked_prob很小)，则多分类损失接近0，梯度解耦！
+                gated_focal_loss = torch.mean(spiked_prob * focal_loss_multi_unreduced)
+                
+                # 最终组合损失
+                loss = 0.75 * loss_bin + 0.25 * gated_focal_loss
                 
                 loss.backward()
                 optimizer.step()
@@ -166,7 +214,7 @@ class OptimizedCNN_Wrapper:
         self.model.eval()
         X_tensor = torch.tensor(X, dtype=torch.float32).unsqueeze(1).to(self.device)
         with torch.no_grad():
-            out_multi, out_bin = self.model(X_tensor)
+            out_multi, out_bin, _ = self.model(X_tensor)
             
             bin_probs = F.softmax(out_bin, dim=1) 
             pure_probs = bin_probs[:, 1] 
@@ -186,6 +234,9 @@ class OptimizedCNN_Wrapper:
         return self.label_encoder.inverse_transform(final_pred.cpu().numpy())
 
 
+# ==========================================
+# 数据加载与图表绘制工具
+# ==========================================
 def load_and_filter_data():
     print("开始加载和筛选数据...")
     try:
@@ -195,7 +246,6 @@ def load_and_filter_data():
         return None
 
     wavenumber_cols = [col for col in df.columns if col.replace('.', '', 1).isdigit()]
-    
     excluded_samples = ['4', '8', '11']
     valid_main_ids = [str(i) for i in range(1, 18) if str(i) not in excluded_samples]
     pure_samples = [f'H{i}' for i in valid_main_ids]
@@ -204,8 +254,7 @@ def load_and_filter_data():
         if pd.isna(x): return 'nan'
         s = str(x).strip().upper()
         nums = re.findall(r'\d+', s)
-        if nums:
-            return str(int(nums[0]))
+        if nums: return str(int(nums[0]))
         return s
             
     df['Main_Honey_ID_Str'] = df['Main_Honey_ID'].apply(clean_id)
@@ -223,9 +272,7 @@ def load_and_filter_data():
     print(f"   - 剩余纯蜂蜜样本数量: {len(pure_df)} 个")
     print(f"   - 混合掺假样本总数量 (Rice+Beet): {len(mixed_spiked_df)} 个")
     
-    if len(mixed_spiked_df) == 0:
-        return None
-    
+    if len(mixed_spiked_df) == 0: return None
     filtered_df = pd.concat([pure_df, mixed_spiked_df], ignore_index=True)
     return filtered_df, wavenumber_cols, pure_samples, valid_main_ids, mixed_spiked_df
 
@@ -234,7 +281,6 @@ def create_concentration_labels(df, spiked_df, pure_samples):
     df_with_labels = df.copy()
     df_with_labels['Concentration_Target'] = 'Unknown'
     df_with_labels['SampleType'] = 'Unknown'
-
     df_with_labels.loc[df_with_labels['Sample'].isin(pure_samples), 'Concentration_Target'] = 'Pure'
     df_with_labels.loc[df_with_labels['Sample'].isin(pure_samples), 'SampleType'] = 'Pure'
 
@@ -263,65 +309,43 @@ def calculate_error_metrics(y_true, y_pred, sample_types):
     pure_misclassified_as_spiked = sum(1 for i in pure_indices if y_true[i] == 'Pure' and y_pred[i] != 'Pure')
     spiked_indices = [i for i, st in enumerate(sample_types) if st != 'Pure']
     spiked_misclassified_as_pure = sum(1 for i in spiked_indices if y_true[i] != 'Pure' and y_pred[i] == 'Pure')
-
-    soft_errors = 0
-    for i, (true_label, pred_label) in enumerate(zip(y_true, y_pred)):
-        if true_label != 'Pure' and pred_label != 'Pure' and true_label != pred_label:
-            soft_errors += 1
+    soft_errors = sum(1 for i, (t, p) in enumerate(zip(y_true, y_pred)) if t != 'Pure' and p != 'Pure' and t != p)
 
     return {
-        'accuracy': accuracy,
-        'pure_misclassified_as_spiked': pure_misclassified_as_spiked,
-        'spiked_misclassified_as_pure': spiked_misclassified_as_pure,
-        'soft_errors': soft_errors,
-        'total_pure': len(pure_indices),
-        'total_spiked': len(spiked_indices)
+        'accuracy': accuracy, 'pure_misclassified_as_spiked': pure_misclassified_as_spiked,
+        'spiked_misclassified_as_pure': spiked_misclassified_as_pure, 'soft_errors': soft_errors,
+        'total_pure': len(pure_indices), 'total_spiked': len(spiked_indices)
     }
-
 
 def run_cnn_mixed_experiment(df, wavenumber_cols, pure_samples, valid_main_ids, mixed_spiked_df, output_dir):
     target_samples = pure_samples + mixed_spiked_df['Sample'].tolist()
     target_df = df[df['Sample'].isin(target_samples)].copy()
     target_df = create_concentration_labels(target_df, mixed_spiked_df, pure_samples)
 
-    model = OptimizedCNN_Wrapper(epochs=65, batch_size=16, lr=0.001, pure_threshold=0.45)
+    # 启用 V3 终极引擎
+    model = OptimizedCNN_Wrapper_V3(epochs=65, batch_size=16, lr=0.001, pure_threshold=0.45)
 
     test_combinations = list(combinations(valid_main_ids, 2))
-    results = []
-    
-    # 【新增】：全局预测结果记录器，用于画最终的混淆矩阵
-    all_y_true_global = []
-    all_y_pred_global = []
-
+    results, all_y_true_global, all_y_pred_global = [], [], []
     weights_dir = os.path.join(output_dir, 'model_weights')
     os.makedirs(weights_dir, exist_ok=True)
 
     print(f"\n=======================================================")
-    print(f"🔬 开始无损微调: Dual-Head CNN (标签平滑 + 概率偏移)")
+    print(f"🔥 开始 V3 终极架构验证: CBAM注意力 + Gated Loss 混合门控")
     print(f"=======================================================")
 
-    last_X_test = None
-    last_y_test = None
-    last_scaler = None
+    last_X_test, last_y_test, last_scaler = None, None, None
 
     for combo_idx, test_ids in enumerate(test_combinations):
         test_ids = list(test_ids)
         train_ids = [m for m in valid_main_ids if m not in test_ids]
 
-        train_pure = [f"H{i}" for i in train_ids]
-        test_pure = [f"H{i}" for i in test_ids]
+        train_pure, test_pure = [f"H{i}" for i in train_ids], [f"H{i}" for i in test_ids]
+        
+        train_df = target_df[(target_df['Sample'].isin(train_pure)) | ((target_df['SampleType'] != 'Pure') & (target_df['Main_Honey_ID_Str'].isin(train_ids)))]
+        test_df = target_df[(target_df['Sample'].isin(test_pure)) | ((target_df['SampleType'] != 'Pure') & (target_df['Main_Honey_ID_Str'].isin(test_ids)))]
 
-        train_df = target_df[
-            (target_df['Sample'].isin(train_pure)) | 
-            ((target_df['SampleType'] != 'Pure') & (target_df['Main_Honey_ID_Str'].isin(train_ids)))
-        ]
-        test_df = target_df[
-            (target_df['Sample'].isin(test_pure)) | 
-            ((target_df['SampleType'] != 'Pure') & (target_df['Main_Honey_ID_Str'].isin(test_ids)))
-        ]
-
-        if len(train_df) == 0 or len(set(train_df['Concentration_Target'].values)) < 2:
-            continue
+        if len(train_df) == 0 or len(set(train_df['Concentration_Target'].values)) < 2: continue
 
         X_train, y_train = train_df[wavenumber_cols].values, train_df['Concentration_Target'].values
         X_test, y_test = test_df[wavenumber_cols].values, test_df['Concentration_Target'].values
@@ -334,114 +358,84 @@ def run_cnn_mixed_experiment(df, wavenumber_cols, pure_samples, valid_main_ids, 
 
         try:
             model.fit(X_train_scaled, y_train)
-            
-            weight_path = os.path.join(weights_dir, f'fold_{combo_idx+1}_model.pth')
-            torch.save(model.model.state_dict(), weight_path)
+            torch.save(model.model.state_dict(), os.path.join(weights_dir, f'fold_{combo_idx+1}_model.pth'))
             
             y_pred = model.predict(X_test_scaled)
             metrics = calculate_error_metrics(y_test, y_pred, sample_types_test)
             
             results.append({
-                'Combination': combo_idx + 1,
-                'Model': 'Dual-Head CNN (Tuned)',
+                'Combination': combo_idx + 1, 'Model': 'RamanDualHeadCNN_V3',
                 'Accuracy': metrics['accuracy'],
                 'Pure_Misclassified_As_Spiked': metrics['pure_misclassified_as_spiked'],
                 'Spiked_Misclassified_As_Pure': metrics['spiked_misclassified_as_pure'],
                 'Soft_Errors': metrics['soft_errors'],
-                'Total_Pure': metrics['total_pure'],
-                'Total_Spiked': metrics['total_spiked']
+                'Total_Pure': metrics['total_pure'], 'Total_Spiked': metrics['total_spiked']
             })
             
-            # 【新增】：收集全局的真实标签和预测标签
             all_y_true_global.extend(y_test)
             all_y_pred_global.extend(y_pred)
-            
-            last_X_test = X_test_scaled
-            last_y_test = y_test
-            last_scaler = scaler
+            last_X_test, last_y_test, last_scaler = X_test_scaled, y_test, scaler
 
             if (combo_idx + 1) % 10 == 0 or (combo_idx + 1) == 91:
-                print(f"   ✓ 稳步推进中: 已完成 {combo_idx + 1}/91 轮交叉验证并保存权重...")
+                print(f"   ✓ V3 网络稳步推进中: 已完成 {combo_idx + 1}/91 轮...")
                 
         except Exception as e:
             print(f"轮次 {combo_idx+1} 失败: {e}")
 
     return pd.DataFrame(results), model, last_X_test, last_y_test, all_y_true_global, all_y_pred_global
 
-
 def summarize_cnn_results(results_df, output_dir, rand_id):
-    if len(results_df) == 0:
-        return
+    if len(results_df) == 0: return
         
-    print(f"\n=== 无损微调 Dual-Head 门控 CNN 混合模型终极指标 ===")
-    
-    total_pure = results_df['Total_Pure'].sum()       
-    total_spiked = results_df['Total_Spiked'].sum()   
+    print(f"\n=== V3 网络 (CBAM + Gated Focal Loss) 终极指标 ===")
+    total_pure, total_spiked = results_df['Total_Pure'].sum(), results_df['Total_Spiked'].sum()
     total_samples = total_pure + total_spiked    
 
     hard_err_pure = results_df['Pure_Misclassified_As_Spiked'].sum() / total_pure * 100 
     hard_err_spiked = results_df['Spiked_Misclassified_As_Pure'].sum() / total_spiked * 100 
     soft_err = results_df['Soft_Errors'].sum() / total_spiked * 100 
-    
-    total_errors = results_df['Pure_Misclassified_As_Spiked'].sum() + results_df['Spiked_Misclassified_As_Pure'].sum() + results_df['Soft_Errors'].sum()
-    total_err_rate = total_errors / total_samples * 100 
+    total_err_rate = (results_df['Pure_Misclassified_As_Spiked'].sum() + results_df['Spiked_Misclassified_As_Pure'].sum() + results_df['Soft_Errors'].sum()) / total_samples * 100 
 
     print("-" * 65)
-    print(f" 测试集样本总数 : {total_samples} (纯蜂蜜 {total_pure} / 混合掺假 {total_spiked})")
-    print("-" * 65)
+    print(f" 样本总数 : {total_samples} (纯品 {total_pure} / 掺假 {total_spiked})")
     print(f" 纯判掺假(%) (硬错误) : {hard_err_pure:>8.2f}%")
     print(f" 掺假判纯(%) (硬错误) : {hard_err_spiked:>8.2f}%")
     print(f" 软错误率(%) (浓度错判): {soft_err:>8.2f}%")
-    print(f" => 【CNN 全局总错误率】: {total_err_rate:>8.2f}%")
+    print(f" => 【V3 全局总错误率】: {total_err_rate:>8.2f}%")
     print("-" * 65)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-    
-    errors = [results_df['Pure_Misclassified_As_Spiked'].sum(), 
-              results_df['Spiked_Misclassified_As_Pure'].sum(), 
-              results_df['Soft_Errors'].sum()]
+    errors = [results_df['Pure_Misclassified_As_Spiked'].sum(), results_df['Spiked_Misclassified_As_Pure'].sum(), results_df['Soft_Errors'].sum()]
     labels = ['Pure -> Spiked (Hard)', 'Spiked -> Pure (Hard)', 'Concentration Error (Soft)']
     colors = ['#ff9999','#66b3ff','#99ff99']
     
     ax1.pie(errors, labels=labels, colors=colors, autopct='%1.2f%%', startangle=90, pctdistance=0.85)
     centre_circle = plt.Circle((0,0),0.70,fc='white')
     ax1.add_patch(centre_circle)
-    ax1.set_title('Distribution of Fine-Tuned CNN Errors')
+    ax1.set_title('Distribution of V3 CNN Errors')
     
     rates = [hard_err_pure, hard_err_spiked, soft_err, total_err_rate]
     bars = ['Pure Error', 'Spiked Error', 'Soft Error', 'Total Error']
     ax2.bar(bars, rates, color=['#ff9999','#66b3ff','#99ff99','#ffcc99'])
-    for i, v in enumerate(rates):
-        ax2.text(i, v + 0.5, f"{v:.2f}%", ha='center', fontweight='bold')
+    for i, v in enumerate(rates): ax2.text(i, v + 0.5, f"{v:.2f}%", ha='center', fontweight='bold')
     ax2.set_ylabel('Error Rate (%)')
-    ax2.set_title('Fine-Tuned CNN Error Rates Summary')
+    ax2.set_title('V3 CNN Error Rates Summary')
     
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f'Fine_Tuned_CNN_Report_{rand_id}.png'), dpi=300)
+    plt.savefig(os.path.join(output_dir, f'V3_CNN_Report_{rand_id}.png'), dpi=300)
     plt.close()
 
-
-# ==========================================
-# 【全新图表】：t-SNE 降维热力可视化
-# ==========================================
 def plot_tsne_visualization(X, y, output_dir, rand_id):
-    """ 在原始高维光谱上进行 t-SNE 降维，展示数据固有的分离度 """
-    print(f"\n=======================================================")
-    print(f"🌌 启动流形学习引擎：生成高维光谱 t-SNE 降维可视化")
-    print(f"=======================================================")
-    
+    print(f"🌌 生成高维光谱 t-SNE 降维可视化...")
     tsne = TSNE(n_components=2, random_state=42, perplexity=30, init='pca', learning_rate='auto')
     X_tsne = tsne.fit_transform(X)
 
     plt.figure(figsize=(10, 8))
-    
-    # 固定的颜色映射，使 Pure 显得突出，各浓度呈渐变
     unique_labels = sorted(list(set(y)))
     colors = sns.color_palette("Set2", len(unique_labels))
     
     for i, label in enumerate(unique_labels):
         mask = (y == label)
-        # 如果是纯蜂蜜，使用鲜艳的颜色并增加 marker 大小
         if label == 'Pure':
             plt.scatter(X_tsne[mask, 0], X_tsne[mask, 1], label=label, color='red', marker='*', s=150, edgecolors='black', zorder=5)
         else:
@@ -453,179 +447,112 @@ def plot_tsne_visualization(X, y, output_dir, rand_id):
     plt.legend(title='Concentration', bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.grid(True, linestyle='--', alpha=0.5)
     plt.tight_layout()
-    
-    tsne_path = os.path.join(output_dir, f'tSNE_Visualization_{rand_id}.png')
-    plt.savefig(tsne_path, dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, f'tSNE_Visualization_{rand_id}.png'), dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"   ✓ t-SNE 流线图已成功生成！保存在: {tsne_path}")
 
-
-# ==========================================
-# 【全新图表】：全局多分类混淆矩阵
-# ==========================================
 def plot_global_confusion_matrix(y_true, y_pred, output_dir, rand_id):
-    """ 汇总 91 轮交叉验证中的所有样本，绘制一张总的混淆矩阵热力图 """
-    print(f"\n=======================================================")
-    print(f"📊 启动统计分析引擎：生成全局混淆矩阵 (Confusion Matrix)")
-    print(f"=======================================================")
-    
-    # 按照合理的浓度顺序排列坐标轴
+    print(f"📊 生成全局混淆矩阵 (Confusion Matrix)...")
     labels_order = ['Pure', 'Mixed-10%', 'Mixed-20%', 'Mixed-30%', 'Mixed-50%']
-    # 如果数据中有部分标签缺失，动态过滤
     labels_order = [lbl for lbl in labels_order if lbl in set(y_true)]
-    
     cm = confusion_matrix(y_true, y_pred, labels=labels_order)
     
     plt.figure(figsize=(10, 8))
-    # 使用 seaborn 画出极具论文质感的热力图
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                xticklabels=labels_order, yticklabels=labels_order,
-                linewidths=1, linecolor='black',
-                annot_kws={"size": 12, "weight": "bold"})
-    
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=labels_order, yticklabels=labels_order,
+                linewidths=1, linecolor='black', annot_kws={"size": 12, "weight": "bold"})
     plt.title('Global Confusion Matrix (Aggregated across 91 Folds)', fontsize=15, fontweight='bold')
     plt.ylabel('True Label (Actual)', fontsize=13, fontweight='bold')
     plt.xlabel('Predicted Label (Model Output)', fontsize=13, fontweight='bold')
     plt.xticks(rotation=45, ha='right')
     plt.yticks(rotation=0)
     plt.tight_layout()
-    
-    cm_path = os.path.join(output_dir, f'Global_Confusion_Matrix_{rand_id}.png')
-    plt.savefig(cm_path, dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, f'Global_Confusion_Matrix_{rand_id}.png'), dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"   ✓ 全局混淆矩阵已成功生成！保存在: {cm_path}")
-
 
 def generate_cnn_saliency_map(model_wrapper, X_test, y_test, wavenumber_cols, output_dir, rand_id):
-    print(f"\n=======================================================")
-    print(f"🧠 启动 CNN 可解释性分析引擎 (Gradient Saliency Map)")
-    print(f"=======================================================")
-    
-    device = model_wrapper.device
-    model = model_wrapper.model
+    print(f"🧠 启动 CNN 可解释性分析引擎 (Gradient Saliency Map)...")
+    device, model = model_wrapper.device, model_wrapper.model
     model.eval()
     
     spiked_indices = [i for i, label in enumerate(y_test) if label != 'Pure']
-    if not spiked_indices:
-        print("未找到测试集中的掺假样本，跳过显著性分析。")
-        return
+    if not spiked_indices: return
         
-    X_spiked = X_test[spiked_indices]
-    
-    X_tensor = torch.tensor(X_spiked, dtype=torch.float32).unsqueeze(1).to(device)
+    X_tensor = torch.tensor(X_test[spiked_indices], dtype=torch.float32).unsqueeze(1).to(device)
     X_tensor.requires_grad_()
     
-    _, out_bin = model(X_tensor)
-    
+    _, out_bin, _ = model(X_tensor) # V3 返回三个变量
     spiked_score = out_bin[:, 0].sum()
-    
     model.zero_grad()
     spiked_score.backward()
     
     gradients = X_tensor.grad.squeeze().cpu().numpy()
     inputs = X_tensor.detach().squeeze().cpu().numpy()
-    
-    saliency = np.abs(gradients * inputs)
-    mean_saliency = np.mean(saliency, axis=0)
+    mean_saliency = np.mean(np.abs(gradients * inputs), axis=0)
     
     if mean_saliency.max() > 0:
         mean_saliency = (mean_saliency - mean_saliency.min()) / (mean_saliency.max() - mean_saliency.min())
         
     wavenumbers = [float(w) for w in wavenumber_cols]
-    top_k = 10
-    top_indices = np.argsort(mean_saliency)[-top_k:]
-    
+    top_indices = np.argsort(mean_saliency)[-10:]
     mean_spectrum = np.mean(inputs, axis=0)
     mean_spectrum = (mean_spectrum - mean_spectrum.min()) / (mean_spectrum.max() - mean_spectrum.min())
     
     fig, ax1 = plt.subplots(figsize=(14, 6))
-    
-    ax1.plot(wavenumbers, mean_spectrum, color='gray', alpha=0.5, linewidth=2, label='Mean Spiked Spectrum (Normalized)')
+    ax1.plot(wavenumbers, mean_spectrum, color='gray', alpha=0.5, linewidth=2, label='Mean Spiked Spectrum')
     ax1.set_xlabel('Raman Shift Wavenumber (cm⁻¹)', fontsize=12, fontweight='bold')
     ax1.set_ylabel('Spectral Intensity', color='gray', fontsize=12, fontweight='bold')
-    ax1.tick_params(axis='y', labelcolor='gray')
     
     ax2 = ax1.twinx()
-    ax2.plot(wavenumbers, mean_saliency, color='red', linewidth=2, alpha=0.8, label='CNN Gradient Saliency Score')
+    ax2.plot(wavenumbers, mean_saliency, color='red', linewidth=2, alpha=0.8, label='CBAM Gradient Saliency')
     ax2.fill_between(wavenumbers, 0, mean_saliency, color='red', alpha=0.1)
     ax2.set_ylabel('Feature Contribution Score', color='red', fontsize=12, fontweight='bold')
-    ax2.tick_params(axis='y', labelcolor='red')
     ax2.set_ylim(0, 1.1)
     
     for idx in top_indices:
-        ax2.annotate(f"{wavenumbers[idx]:.1f}", 
-                     xy=(wavenumbers[idx], mean_saliency[idx]), 
-                     xytext=(0, 15), textcoords="offset points", 
-                     ha='center', va='bottom', fontsize=9, rotation=90, 
-                     color='darkred', weight='bold',
-                     arrowprops=dict(arrowstyle='->', color='darkred', alpha=0.5))
+        ax2.annotate(f"{wavenumbers[idx]:.1f}", xy=(wavenumbers[idx], mean_saliency[idx]), 
+                     xytext=(0, 15), textcoords="offset points", ha='center', va='bottom', fontsize=9, rotation=90, 
+                     color='darkred', weight='bold', arrowprops=dict(arrowstyle='->', color='darkred', alpha=0.5))
 
-    plt.title('Explainable AI (XAI): Key Biomarkers Driving CNN Adulteration Detection', fontsize=15, fontweight='bold')
-    
+    plt.title('Explainable AI: Key Biomarkers Driving V3 CNN Detection', fontsize=15, fontweight='bold')
     lines, labels = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax2.legend(lines + lines2, labels + labels2, loc='upper left')
-    
     plt.tight_layout()
-    saliency_path = os.path.join(output_dir, f'CNN_Saliency_Map_{rand_id}.png')
-    plt.savefig(saliency_path, dpi=300)
+    plt.savefig(os.path.join(output_dir, f'V3_Saliency_Map_{rand_id}.png'), dpi=300)
     plt.close()
-    print(f"   ✓ 显著性热力图已成功生成！保存在: {saliency_path}")
-
 
 def main():
-    if not torch.cuda.is_available():
-        print("💡 提示: 当前使用 CPU 训练。")
-        
+    if not torch.cuda.is_available(): print("💡 提示: 当前使用 CPU 训练。")
     data_res = load_and_filter_data()
     if data_res is None: return
     df, wavenumber_cols, pure_samples, valid_main_ids, mixed_spiked_df = data_res
 
     run_time = datetime.datetime.now().strftime("%Y%m%d_%H%M")
     rand_id = f"{random.randint(10000, 99999)}"  
-    
-    output_dir = f'ml_results/run_{run_time}_{rand_id}_DualHead_Tuned'
+    output_dir = f'ml_results/run_{run_time}_{rand_id}_V3_Architecture'
     os.makedirs(output_dir, exist_ok=True)
-    
-    print(f"\n📂 本次运行资产将全部分类保存在: {output_dir}")
+    print(f"\n📂 本次 V3 运行资产将全部分类保存在: {output_dir}")
 
-    # ==========================================
-    # 在进行繁重的交叉验证前，先跑一次全局的 t-SNE 降维可视化
-    # ==========================================
     target_samples = pure_samples + mixed_spiked_df['Sample'].tolist()
     target_df = df[df['Sample'].isin(target_samples)].copy()
     target_df = create_concentration_labels(target_df, mixed_spiked_df, pure_samples)
+    X_all_scaled = StandardScaler().fit_transform(target_df[wavenumber_cols].values)
     
-    X_all = target_df[wavenumber_cols].values
-    y_all = target_df['Concentration_Target'].values
-    # t-SNE 前进行标准化缩放，能获得更真实的流形聚类效果
-    X_all_scaled = StandardScaler().fit_transform(X_all)
-    plot_tsne_visualization(X_all_scaled, y_all, output_dir, rand_id)
+    plot_tsne_visualization(X_all_scaled, target_df['Concentration_Target'].values, output_dir, rand_id)
 
-    # ---------------------------------------------------------
-    # 核心执行: 运行 91 轮交叉验证 CNN，并额外接收全局真实与预测标签
-    # ---------------------------------------------------------
     cnn_results, trained_model_wrapper, last_X_test, last_y_test, all_y_true, all_y_pred = run_cnn_mixed_experiment(
         df, wavenumber_cols, pure_samples, valid_main_ids, mixed_spiked_df, output_dir
     )
     
-    # ==========================================
-    # 依据 91 轮的全局反馈绘制混淆矩阵 (Confusion Matrix)
-    # ==========================================
     plot_global_confusion_matrix(all_y_true, all_y_pred, output_dir, rand_id)
-    
-    # 汇总并保存统计结果
     summarize_cnn_results(cnn_results, output_dir, rand_id)
-    
-    csv_name = f'Dual_Head_CNN_91_rounds_Tuned_{rand_id}.csv'
-    cnn_results.to_csv(os.path.join(output_dir, csv_name), index=False)
+    cnn_results.to_csv(os.path.join(output_dir, f'V3_CNN_91_rounds_{rand_id}.csv'), index=False)
     
     if trained_model_wrapper is not None and last_X_test is not None:
         generate_cnn_saliency_map(trained_model_wrapper, last_X_test, last_y_test, wavenumber_cols, output_dir, rand_id)
     
-    print(f"\n✅ 所有实验流水线（交叉验证、t-SNE、混淆矩阵、可解释性图谱）均运行完毕并归档！")
+    print(f"\n✅ V3 终极流水线已执行完毕！")
 
 if __name__ == "__main__":
     main()
-#sbatch run_main_v2.sh
-#tail -f train_log_v2.txt
+#sbatch run_main_v3.sh
+#tail -f train_log_v3.txt
