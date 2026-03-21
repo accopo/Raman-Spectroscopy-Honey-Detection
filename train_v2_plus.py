@@ -413,5 +413,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-#sbatch run_test.sh
-#tail -f train_log.txt
+#sbatch run_main_v2.sh
+#tail -f train_log_v2.txt
